@@ -45,8 +45,17 @@ function surveyRow(row: Omit<Survey, 'createdAt' | 'updatedAt' | 'revision' | 'g
   };
 }
 
-function replantRow(row: Omit<Replant, 'createdAt' | 'updatedAt' | 'revision'>): Replant {
-  return { ...row, createdAt: SEED_TIME, updatedAt: SEED_TIME, revision: ROW_REVISION };
+function replantRow(row: Omit<Replant, 'createdAt' | 'updatedAt' | 'revision' | 'actualCount' | 'actualDate' | 'suspended' | 'suspendReason'> & Partial<Pick<Replant, 'actualCount' | 'actualDate' | 'suspended' | 'suspendReason'>>): Replant {
+  return {
+    ...row,
+    actualCount: row.actualCount ?? 0,
+    actualDate: row.actualDate ?? '',
+    suspended: row.suspended ?? false,
+    suspendReason: row.suspendReason ?? '',
+    createdAt: SEED_TIME,
+    updatedAt: SEED_TIME,
+    revision: ROW_REVISION,
+  };
 }
 
 /**
@@ -135,8 +144,8 @@ export async function seedDatabase(): Promise<void> {
   // ---------------- 补植计划（每地块 1 条，覆盖三种状态） ----------------
   const replants: Replant[] = [
     replantRow({ id: 'replant-a1', plotId: SEED_IDS.plotA, missingCount: 1092, planDate: '2025-04-10', species: '秋茄', state: '待补植' }),
-    replantRow({ id: 'replant-b1', plotId: SEED_IDS.plotB, missingCount: 1188, planDate: '2025-04-18', species: '白骨壤', state: '已补植' }),
-    replantRow({ id: 'replant-c1', plotId: SEED_IDS.plotC, missingCount: 560, planDate: '2024-11-05', species: '无瓣海桑', state: '已复核' }),
+    replantRow({ id: 'replant-b1', plotId: SEED_IDS.plotB, missingCount: 1188, planDate: '2025-04-18', species: '白骨壤', state: '已补植', actualCount: 1188, actualDate: '2025-04-20' }),
+    replantRow({ id: 'replant-c1', plotId: SEED_IDS.plotC, missingCount: 560, planDate: '2024-11-05', species: '无瓣海桑', state: '已复核', actualCount: 560, actualDate: '2024-11-08' }),
   ];
 
   await db.transaction('rw', db.plots, db.seedlings, db.plantings, db.surveys, db.replants, async () => {

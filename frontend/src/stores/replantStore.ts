@@ -7,6 +7,7 @@ import { create } from 'zustand';
 import type { Replant, ReplantDraft, ReplantState } from '../types/replant';
 import {
   advanceReplantState,
+  confirmReplant,
   db,
   exportSnapshot,
   importSnapshot,
@@ -14,6 +15,8 @@ import {
   putReplant,
   removeReplant,
   resetDatabase,
+  saveWithRetry,
+  type ConfirmReplantResult,
   type DatabaseSnapshot,
 } from '../utils/db';
 import { nowIso, uuid } from '../utils/id';
@@ -44,8 +47,12 @@ export interface ReplantStoreState {
   saveDraft: (replantId: string) => Promise<void>;
   createReplant: (draft: ReplantDraft) => Promise<Replant>;
   deleteReplant: (replantId: string) => Promise<void>;
-  /** 推进到下一状态；进入「已补植」时回写地块缺株数并重算成活率 */
-  advance: (replantId: string) => Promise<ReplantState | null>;
+  /** 推进到下一状态；进入「已补植」时只在补植计划侧留实际补植株数与日期 */
+  advance: (replantId: string, actualCount?: number, actualDate?: string) => Promise<ReplantState | null>;
+  /** 验收组确认：核对实际补植株数与当前缺株数，对不上先挂起，对得上才重算成活率 */
+  confirm: (replantId: string) => Promise<ConfirmReplantResult>;
+  /** 修改实际补植信息（用于挂起后核对修正），清除挂起标记 */
+  updateActual: (replantId: string, actualCount: number, actualDate: string) => Promise<void>;
   setState: (replantId: string, state: ReplantState) => Promise<void>;
   batchAdvance: () => Promise<number>;
   setSelectedIds: (ids: string[]) => void;
@@ -112,6 +119,10 @@ export const useReplantStore = create<ReplantStoreState>((set, get) => ({
       planDate: draft.planDate,
       species: draft.species,
       state: draft.state,
+      actualCount: draft.actualCount ?? 0,
+      actualDate: draft.actualDate ?? '',
+      suspended: draft.suspended ?? false,
+      suspendReason: draft.suspendReason ?? '',
       createdAt: stamp,
       updatedAt: stamp,
       revision: 2,
@@ -130,19 +141,41 @@ export const useReplantStore = create<ReplantStoreState>((set, get) => ({
     });
   },
 
-  async advance(replantId) {
+  async advance(replantId, actualCount?, actualDate?) {
     const existing = await db.replants.get(replantId);
     if (!existing) return null;
     const index = FLOW.indexOf(existing.state);
     if (index < 0 || index >= FLOW.length - 1) return null;
     const next = FLOW[index + 1];
-    await advanceReplantState(replantId, next);
+    await advanceReplantState(replantId, next, actualCount, actualDate);
     await usePlotStore.getState().refreshCounts();
     set({
       revision: get().revision + 1,
-      lastMessage: next === '已补植' ? '已标记补植完成，地块缺株数与成活率已回写' : `状态已推进为「${next}」`,
+      lastMessage: next === '已补植' ? '已标记补植完成，实际补植信息已记录' : `状态已推进为「${next}」`,
     });
     return next;
+  },
+
+  async confirm(replantId) {
+    const result = await confirmReplant(replantId);
+    await usePlotStore.getState().refreshCounts();
+    set({ revision: get().revision + 1 });
+    return result;
+  },
+
+  async updateActual(replantId, actualCount, actualDate) {
+    const existing = await db.replants.get(replantId);
+    if (!existing) return;
+    await saveWithRetry('补植计划', () =>
+      db.replants.update(replantId, {
+        actualCount,
+        actualDate,
+        suspended: false,
+        suspendReason: '',
+        updatedAt: nowIso(),
+      }),
+    );
+    set({ revision: get().revision + 1 });
   },
 
   async setState(replantId, state) {

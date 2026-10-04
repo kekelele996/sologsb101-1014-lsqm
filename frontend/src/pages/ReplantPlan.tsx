@@ -73,6 +73,8 @@ export default function ReplantPlan() {
   const createReplant = useReplantStore((state) => state.createReplant);
   const deleteReplant = useReplantStore((state) => state.deleteReplant);
   const advance = useReplantStore((state) => state.advance);
+  const confirmReplantAction = useReplantStore((state) => state.confirm);
+  const updateActual = useReplantStore((state) => state.updateActual);
   const batchAdvance = useReplantStore((state) => state.batchAdvance);
   const selectedIds = useReplantStore((state) => state.selectedIds);
   const setSelectedIds = useReplantStore((state) => state.setSelectedIds);
@@ -86,6 +88,12 @@ export default function ReplantPlan() {
   const [editing, setEditing] = useState<Replant | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [form] = Form.useForm<ReplantFormValues>();
+
+  // 补植完成弹窗：现场班组填写实际补植株数与日期
+  const [advanceOpen, setAdvanceOpen] = useState(false);
+  const [advanceTarget, setAdvanceTarget] = useState<Replant | null>(null);
+  const [advanceForm] = Form.useForm<{ actualCount: number; actualDate: Dayjs }>();
+  const [advancing, setAdvancing] = useState(false);
 
   const plotName = (plotId: string): string => plots.find((item) => item.id === plotId)?.name ?? '（地块已删除）';
 
@@ -106,10 +114,12 @@ export default function ReplantPlan() {
     const missing = rows.reduce((acc, row) => acc + row.missingCount, 0);
     const reviewed = rows.filter((row) => row.state === '已复核').length;
     const pending = rows.filter((row) => row.state === '待补植').length;
+    const suspended = rows.filter((row) => row.suspended).length;
     return {
       missing,
       pending,
       reviewed,
+      suspended,
       reviewPct: rows.length === 0 ? 0 : Math.round((reviewed / rows.length) * 1000) / 10,
     };
   }, [rows]);
@@ -167,12 +177,53 @@ export default function ReplantPlan() {
   };
 
   const handleAdvance = async (row: Replant): Promise<void> => {
-    const next = await advance(row.id);
-    if (next === null) {
-      message.info('该计划已处于最终状态（已复核）');
+    // 待补植 → 已补植：现场班组填写实际补植株数与日期
+    // 已补植但被挂起：允许现场修改实际补植信息后重新提交验收组确认
+    if (row.state === '待补植' || (row.state === '已补植' && row.suspended)) {
+      setAdvanceTarget(row);
+      advanceForm.setFieldsValue({
+        actualCount: row.actualCount > 0 ? row.actualCount : row.missingCount,
+        actualDate: row.actualDate ? dayjs(row.actualDate) : dayjs(),
+      });
+      setAdvanceOpen(true);
       return;
     }
-    message.success(`状态已推进为「${next}」`);
+    // 已补植（未挂起）→ 已复核：验收组确认
+    if (row.state === '已补植') {
+      const result = await confirmReplantAction(row.id);
+      if (result.ok) {
+        message.success('验收组已确认，成活率与地块缺株数已回写');
+      } else {
+        message.warning(result.reason, 6);
+      }
+      return;
+    }
+    message.info('该计划已处于最终状态（已复核）');
+  };
+
+  const handleAdvanceSubmit = async (): Promise<void> => {
+    if (advanceTarget === null) return;
+    try {
+      const values = await advanceForm.validateFields();
+      setAdvancing(true);
+      if (advanceTarget.state === '已补植' && advanceTarget.suspended) {
+        // 挂起后修正实际补植信息
+        await updateActual(advanceTarget.id, values.actualCount, values.actualDate.format('YYYY-MM-DD'));
+        message.success('实际补植信息已更新，可重新提交验收组确认');
+      } else {
+        const next = await advance(advanceTarget.id, values.actualCount, values.actualDate.format('YYYY-MM-DD'));
+        if (next === null) {
+          message.info('该计划已处于最终状态（已复核）');
+        } else {
+          message.success(`已标记补植完成，实际补植 ${values.actualCount} 株`);
+        }
+      }
+      setAdvanceOpen(false);
+    } catch (error) {
+      if (error instanceof Error) message.error(error.message);
+    } finally {
+      setAdvancing(false);
+    }
   };
 
   const handleExport = async (): Promise<void> => {
@@ -290,9 +341,41 @@ export default function ReplantPlan() {
       dataIndex: 'state',
       key: 'state',
       width: 110,
-      render: (value: ReplantState) => (
-        <Tag color={value === '待补植' ? 'orange' : value === '已补植' ? 'blue' : 'green'}>{value}</Tag>
+      render: (value: ReplantState, record) => (
+        <Space direction="vertical" size={0}>
+          <Tag color={value === '待补植' ? 'orange' : value === '已补植' ? 'blue' : 'green'}>{value}</Tag>
+          {record.suspended ? <Tag color="red">已挂起</Tag> : null}
+        </Space>
       ),
+    },
+    {
+      title: '实际补植',
+      key: 'actual',
+      width: 160,
+      render: (_value, record) =>
+        record.state === '待补植' ? (
+          <Typography.Text type="secondary">—</Typography.Text>
+        ) : (
+          <Space direction="vertical" size={0}>
+            <span>{record.actualCount.toLocaleString('zh-CN')} 株</span>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              {record.actualDate || '—'}
+            </Typography.Text>
+          </Space>
+        ),
+    },
+    {
+      title: '挂起原因',
+      key: 'suspendReason',
+      width: 200,
+      render: (_value, record) =>
+        record.suspended ? (
+          <Typography.Text type="danger" style={{ fontSize: 12 }}>
+            {record.suspendReason}
+          </Typography.Text>
+        ) : (
+          <Typography.Text type="secondary">—</Typography.Text>
+        ),
     },
     {
       title: '草稿',
@@ -343,7 +426,13 @@ export default function ReplantPlan() {
             disabled={record.state === '已复核'}
             onClick={() => void handleAdvance(record)}
           >
-            推进状态
+            {record.state === '待补植'
+              ? '补植完成'
+              : record.state === '已补植' && record.suspended
+                ? '修正补植信息'
+                : record.state === '已补植'
+                  ? '验收组确认'
+                  : '已复核'}
           </Button>
           <Button size="small" type="link" icon={<EditOutlined />} onClick={() => openEdit(record)}>
             编辑
@@ -373,6 +462,13 @@ export default function ReplantPlan() {
         <StatBadge label="补植计划" value={rows.length} suffix="条" tone="primary" />
         <StatBadge label="待补植" value={stats.pending} suffix="条" tone={stats.pending > 0 ? 'warning' : 'default'} />
         <StatBadge label="缺株合计" value={stats.missing.toLocaleString('zh-CN')} suffix="株" tone="danger" />
+        <StatBadge
+          label="已挂起"
+          value={stats.suspended}
+          suffix="条"
+          tone={stats.suspended > 0 ? 'danger' : 'default'}
+          hint="验收组确认时数据对不上的补植计划，待现场核对后再确认"
+        />
         <StatBadge
           label="复核完成率"
           value={percentText(stats.reviewPct)}
@@ -467,7 +563,7 @@ export default function ReplantPlan() {
             loading={loading || !ready}
             columns={columns}
             dataSource={filtered}
-            scroll={{ x: 1400 }}
+            scroll={{ x: 1700 }}
             rowSelection={{
               selectedRowKeys: selectedIds,
               onChange: (keys) => setSelectedIds(keys.map((key) => String(key))),
@@ -515,7 +611,33 @@ export default function ReplantPlan() {
             </Form.Item>
           </Space>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            状态推进到「已补植」时，会自动回写地块缺株数并重算最新一次验收的成活率。
+            状态推进到「已补植」时只记录实际补植株数与日期，验收组成确认后才重算成活率。
+          </Typography.Text>
+        </Form>
+      </Modal>
+
+      <Modal
+        title="补植完成登记"
+        open={advanceOpen}
+        onCancel={() => setAdvanceOpen(false)}
+        onOk={() => void handleAdvanceSubmit()}
+        confirmLoading={advancing}
+        okText="确认补植完成"
+        cancelText="取消"
+      >
+        <Form form={advanceForm} layout="vertical">
+          <Form.Item
+            name="actualCount"
+            label="实际补植株数（株）"
+            rules={[{ required: true, message: '请填写实际补植株数' }]}
+          >
+            <InputNumber min={1} max={200000} step={10} style={{ width: '100%' }} />
+          </Form.Item>
+          <Form.Item name="actualDate" label="实际补植日期" rules={[{ required: true, message: '请选择实际补植日期' }]}>
+            <DatePicker style={{ width: '100%' }} />
+          </Form.Item>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            补植完成后只在补植计划侧留实际补植株数与日期，不改写验收成活率；验收组确认后才重算。
           </Typography.Text>
         </Form>
       </Modal>

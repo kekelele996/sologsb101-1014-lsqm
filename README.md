@@ -100,11 +100,12 @@ sologsb101-1014/
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
 * **数据库名**：`gbmangrove`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`，`version(1)` 建立全部表，`version(2)` 补齐索引并执行 `.upgrade()` 迁移：
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`，`version(1)` 建立全部表，`version(2)` 补齐索引并执行 `.upgrade()` 迁移，`version(3)` 两侧分记（现场班组侧 / 项目部验收组侧）并补齐实际补植信息与挂起标记：
   * 为 `plots` 增加 `updatedAt`、`surveys` 增加 `[plotId+round]` 复合索引、`plantings` 增加 `spacingM` 索引等；
   * 回填 `revision` / `createdAt` / `updatedAt`；
   * 为 `plots` 补齐 `missingCount`、`lastReplantDate` 回写字段；
-  * 为 `surveys` 补齐 `grade`、`gradeManual` 字段（按 `survivalRate` 自动判定等级）。
+  * 为 `surveys` 补齐 `grade`、`gradeManual` 字段（按 `survivalRate` 自动判定等级）；
+  * 为 `replants` 补齐 `actualCount`、`actualDate`、`suspended`、`suspendReason` 字段（实际补植信息与挂起标记）。
 * **表结构**：
 
   | 表 | 主键 | 主要索引 |
@@ -150,5 +151,5 @@ npm run preview      # 预览 dist 产物
 * **成活率** = 成活株数 ÷ 该地块栽植总株数 × 100%（`src/utils/rate.ts` 统一口径）。
 * **成活率等级**：≥ 85% 优，70%–85% 良，50%–70% 一般，< 50% 差；低于 50% 视为告警，建议生成补植计划。
 * **密度合理性**：平均单株占地面积需落在 0.6–12 ㎡/株；过密/过疏都会在栽植记录页给出提示。
-* **补植回写**：补植状态推进到「已补植」时，自动扣减地块缺株数、写入最近补植日期，
-  并按「原成活株数 + 本次补植株数」重算最新一次验收的成活率。
+* **补植分侧**：现场班组侧（苗木批次 / 栽植记录）与项目部验收组侧（验收测次 / 补植计划）各留各的记录，谁也改不到对方。栽植株数一变，没定级的测次立刻重算，人工定过级的照旧。
+* **补植回写**：补植状态推进到「已补植」时只在补植计划侧留实际补植株数与日期，不改写验收成活率；验收组确认后才重算成活率并回写地块缺株数，对不上的地块先挂起。

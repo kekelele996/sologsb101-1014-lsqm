@@ -110,7 +110,10 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
     const existing = await db.surveys.get(surveyId);
     if (!existing) return;
     const total = totalPlantedOf(draft.plotId);
-    const survivalRate = calcSurvivalRate(draft.aliveCount, total);
+    // 人工定过级的测次：成活率照旧，不随栽植记录重算
+    const survivalRate = existing.gradeManual
+      ? existing.survivalRate
+      : calcSurvivalRate(draft.aliveCount, total);
     await putSurvey({
       ...existing,
       plotId: draft.plotId,
@@ -152,6 +155,10 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
       planDate: new Date(Date.now() + 15 * 24 * 3600 * 1000).toISOString().slice(0, 10),
       species,
       state: '待补植',
+      actualCount: 0,
+      actualDate: '',
+      suspended: false,
+      suspendReason: '',
       createdAt: stamp,
       updatedAt: stamp,
       revision: 2,

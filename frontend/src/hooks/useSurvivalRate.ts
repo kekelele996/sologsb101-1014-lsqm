@@ -72,7 +72,13 @@ export function buildSurvivalSummary(
     .filter((row) => row.plotId === plotId)
     .sort((a, b) => a.round - b.round)
     .map((row) => {
-      const rate = totalCount > 0 ? calcSurvivalRate(row.aliveCount, totalCount) : row.survivalRate;
+      // 人工定过级的测次：成活率照旧，不随栽植记录重算（验收组侧的结论不被现场侧改动）
+      // 没定级的测次：按当前栽植总株数立刻重算
+      const rate = row.gradeManual
+        ? row.survivalRate
+        : totalCount > 0
+          ? calcSurvivalRate(row.aliveCount, totalCount)
+          : row.survivalRate;
       return {
         surveyId: row.id,
         round: row.round,

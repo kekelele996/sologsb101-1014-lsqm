@@ -11,7 +11,7 @@ import type { Seedling } from '../types/seedling';
 import type { Planting } from '../types/planting';
 import type { Survey } from '../types/survey';
 import type { Replant, ReplantState } from '../types/replant';
-import { rateLevel } from './rate';
+import { calcSurvivalRate, rateLevel } from './rate';
 import { nowIso, today } from './id';
 import { seedDatabase } from './seed';
 
@@ -19,7 +19,7 @@ import { seedDatabase } from './seed';
 export const DB_NAME = 'gbmangrove';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 /** 数据行结构修订号 */
 export const ROW_REVISION = 2;
@@ -44,7 +44,7 @@ class MangroveDatabase extends Dexie {
     });
 
     // ---------- v2：补齐索引与回写字段，并迁移历史数据 ----------
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         plots: 'id, name, tideZone, substrate, restoreMode, state, createdAt, updatedAt',
         seedlings: 'id, plotId, species, source, arrivalDate, quantity',
@@ -79,6 +79,44 @@ class MangroveDatabase extends Dexie {
           const rate = typeof row.survivalRate === 'number' ? row.survivalRate : 0;
           if (typeof row.grade !== 'string') row.grade = rateLevel(rate);
           if (typeof row.gradeManual !== 'boolean') row.gradeManual = false;
+        });
+      });
+
+    // ---------- v3：两侧分记，各留各的那份 ----------
+    // 现场班组侧（苗木批次 / 栽植记录）与项目部验收组侧（验收测次 / 补植计划）分开记：
+    // - 补植完成只在补植计划侧留实际补植株数与日期，不改写验收成活率
+    // - 验收组确认后才重算成活率，对不上的地块先挂起
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        plots: 'id, name, tideZone, substrate, restoreMode, state, createdAt, updatedAt',
+        seedlings: 'id, plotId, species, source, arrivalDate, quantity',
+        plantings: 'id, plotId, seedlingId, plantDate, spacingM',
+        surveys: 'id, plotId, [plotId+round], date, grade',
+        replants: 'id, plotId, planDate, state, species',
+      })
+      .upgrade(async (tx) => {
+        // 迁移 4：验收记录补齐定级来源（按当时成活率补上）
+        await tx.table('surveys').toCollection().modify((row: Record<string, unknown>) => {
+          const rate = typeof row.survivalRate === 'number' ? row.survivalRate : 0;
+          if (typeof row.grade !== 'string') row.grade = rateLevel(rate);
+          if (typeof row.gradeManual !== 'boolean') row.gradeManual = false;
+        });
+        // 迁移 5：地块补齐回写标记（缺株数 / 最近补植日期）
+        await tx.table('plots').toCollection().modify((row: Record<string, unknown>) => {
+          if (typeof row.missingCount !== 'number') row.missingCount = 0;
+          if (typeof row.lastReplantDate !== 'string') row.lastReplantDate = '';
+        });
+        // 迁移 6：补植计划补齐实际补植信息与挂起标记
+        await tx.table('replants').toCollection().modify((row: Record<string, unknown>) => {
+          const wasDone = row.state === '已补植' || row.state === '已复核';
+          if (typeof row.actualCount !== 'number') {
+            row.actualCount = wasDone && typeof row.missingCount === 'number' ? row.missingCount : 0;
+          }
+          if (typeof row.actualDate !== 'string') {
+            row.actualDate = wasDone && typeof row.updatedAt === 'string' ? row.updatedAt.slice(0, 10) : '';
+          }
+          if (typeof row.suspended !== 'boolean') row.suspended = false;
+          if (typeof row.suspendReason !== 'string') row.suspendReason = '';
         });
       });
   }
@@ -233,47 +271,122 @@ export async function removeReplant(id: string): Promise<void> {
   await db.replants.delete(id);
 }
 
-/**
- * 补植完成回写：
- * 1）扣减地块缺株数；2）写入最近补植日期；3）按补植后的总株数重算最新一次验收的成活率。
- */
-export async function applyReplantCompletion(replantId: string): Promise<void> {
-  await db.transaction('rw', db.plots, db.replants, db.surveys, db.plantings, async () => {
-    const replant = await db.replants.get(replantId);
-    if (!replant) return;
-    const plot = await db.plots.get(replant.plotId);
-    if (!plot) return;
+/* ------------------------------ 分侧保存（失败只重试本侧） ------------------------------ */
 
-    const nextMissing = Math.max(0, plot.missingCount - replant.missingCount);
-    await db.plots.update(plot.id, {
-      missingCount: nextMissing,
-      lastReplantDate: today(),
-      updatedAt: nowIso(),
-    });
-
-    const plantings = await db.plantings.where('plotId').equals(plot.id).toArray();
-    const total = plantings.reduce((acc, item) => acc + item.count, 0);
-    const surveys = await db.surveys.where('plotId').equals(plot.id).toArray();
-    if (surveys.length === 0) return;
-    const latest = surveys.reduce((acc, item) => (item.round > acc.round ? item : acc));
-    // 补植后按「原成活株数 + 本次补植株数」重新计算成活率
-    const aliveAfter = latest.aliveCount + replant.missingCount;
-    const rate = total > 0 ? Math.round(Math.min(100, (aliveAfter / total) * 100) * 10) / 10 : latest.survivalRate;
-    await db.surveys.update(latest.id, {
-      aliveCount: aliveAfter,
-      survivalRate: rate,
-      grade: latest.gradeManual ? latest.grade : rateLevel(rate),
-      updatedAt: nowIso(),
-    });
-  });
+/** 单侧重试：某一侧保存失败后只重试该侧，不波及另一侧 */
+export async function saveWithRetry(side: string, fn: () => Promise<unknown>, retries = 3): Promise<void> {
+  let lastErr: unknown;
+  for (let i = 0; i < retries; i++) {
+    try {
+      await fn();
+      return;
+    } catch (err) {
+      lastErr = err;
+      if (i < retries - 1) await new Promise((resolve) => setTimeout(resolve, 200 * (i + 1)));
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(`${side}保存失败`);
 }
 
-/** 推进补植状态（待补植 → 已补植 → 已复核），推进到「已补植」时触发回写 */
-export async function advanceReplantState(replantId: string, next: ReplantState): Promise<void> {
-  await db.replants.update(replantId, { state: next, updatedAt: nowIso() });
+/** 推进补植状态（待补植 → 已补植 → 已复核） */
+export async function advanceReplantState(
+  replantId: string,
+  next: ReplantState,
+  actualCount?: number,
+  actualDate?: string,
+): Promise<void> {
+  const patch: Partial<Replant> = { state: next, updatedAt: nowIso() };
   if (next === '已补植') {
-    await applyReplantCompletion(replantId);
+    const replant = await db.replants.get(replantId);
+    if (replant) {
+      patch.actualCount = actualCount ?? replant.missingCount;
+      patch.actualDate = actualDate ?? today();
+      // 补植完成只在补植计划侧留实际补植株数与日期，不改写验收成活率
+      patch.suspended = false;
+      patch.suspendReason = '';
+    }
   }
+  await saveWithRetry('补植计划', () => db.replants.update(replantId, patch));
+}
+
+/** 验收组确认结果 */
+export interface ConfirmReplantResult {
+  ok: boolean;
+  /** 挂起原因（ok = false 时） */
+  reason: string;
+}
+
+/**
+ * 验收组确认补植：
+ * 1）核对实际补植株数与当前缺株数是否对得上，对不上先挂起；
+ * 2）对得上才重算最新测次成活率（人工定过级的测次也一并回写为验收组确认值）；
+ * 3）回写地块缺株数与最近补植日期。
+ * 各侧独立保存，失败只重试本侧。
+ */
+export async function confirmReplant(replantId: string): Promise<ConfirmReplantResult> {
+  const replant = await db.replants.get(replantId);
+  if (!replant) return { ok: false, reason: '补植计划不存在' };
+  if (replant.state !== '已补植') return { ok: false, reason: '只有「已补植」的计划才能确认' };
+
+  const plot = await db.plots.get(replant.plotId);
+  if (!plot) return { ok: false, reason: '地块不存在或已被删除' };
+
+  const plantings = await db.plantings.where('plotId').equals(plot.id).toArray();
+  const total = plantings.reduce((acc, item) => acc + item.count, 0);
+  const surveys = await db.surveys.where('plotId').equals(plot.id).toArray();
+  if (surveys.length === 0) return { ok: false, reason: '该地块尚无验收记录，无法重算成活率' };
+
+  const latest = surveys.reduce((acc, item) => (item.round > acc.round ? item : acc));
+  const expectedMissing = Math.max(0, total - latest.aliveCount);
+
+  // 对不上：先挂起，不改写任何一侧
+  if (replant.actualCount !== expectedMissing) {
+    await saveWithRetry('补植计划', () =>
+      db.replants.update(replantId, {
+        suspended: true,
+        suspendReason: `实际补植 ${replant.actualCount} 株，与当前缺株 ${expectedMissing} 株不符`,
+        updatedAt: nowIso(),
+      }),
+    );
+    return {
+      ok: false,
+      reason: `数据对不上：实际补植 ${replant.actualCount} 株，当前缺株 ${expectedMissing} 株，已挂起待核对`,
+    };
+  }
+
+  // 对得上：验收组重算成活率（验收侧保存）
+  const aliveAfter = latest.aliveCount + replant.actualCount;
+  const rate = calcSurvivalRate(aliveAfter, total);
+  await saveWithRetry('验收测次', () =>
+    db.surveys.update(latest.id, {
+      aliveCount: aliveAfter,
+      survivalRate: rate,
+      grade: rateLevel(rate),
+      gradeManual: true,
+      updatedAt: nowIso(),
+    }),
+  );
+
+  // 回写地块（地块侧保存）
+  await saveWithRetry('地块', () =>
+    db.plots.update(plot.id, {
+      missingCount: Math.max(0, plot.missingCount - replant.actualCount),
+      lastReplantDate: replant.actualDate,
+      updatedAt: nowIso(),
+    }),
+  );
+
+  // 补植计划侧：标记已复核
+  await saveWithRetry('补植计划', () =>
+    db.replants.update(replantId, {
+      state: '已复核',
+      suspended: false,
+      suspendReason: '',
+      updatedAt: nowIso(),
+    }),
+  );
+
+  return { ok: true, reason: '' };
 }
 
 /* ---------------------------- 整库快照 ---------------------------- */

@@ -24,6 +24,14 @@ export interface Replant {
   species: SeedlingSpecies;
   /** 补植状态 */
   state: ReplantState;
+  /** 实际补植株数（株）——推进到「已补植」时由现场班组填写，验收组确认前不改写验收成活率 */
+  actualCount: number;
+  /** 实际补植日期 YYYY-MM-DD——推进到「已补植」时填写 */
+  actualDate: string;
+  /** 是否挂起——验收组确认时若数据对不上则挂起，待现场核对后再确认 */
+  suspended: boolean;
+  /** 挂起原因 */
+  suspendReason: string;
   createdAt: string;
   updatedAt: string;
   revision: number;
@@ -36,4 +44,8 @@ export interface ReplantDraft {
   planDate: string;
   species: SeedlingSpecies;
   state: ReplantState;
+  actualCount?: number;
+  actualDate?: string;
+  suspended?: boolean;
+  suspendReason?: string;
 }
