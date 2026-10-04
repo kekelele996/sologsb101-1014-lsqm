@@ -5,12 +5,13 @@
  */
 import { create } from 'zustand';
 import type { RateLevel, Survey } from '../types/survey';
-import { db, initDatabase, patchSurveyGrades, putSurvey, removeSurvey } from '../utils/db';
+import { ROW_REVISION, db, initDatabase, patchSurveyGrades, putSurvey, removeSurvey } from '../utils/db';
 import type { SurvivalSummary } from '../hooks/useSurvivalRate';
 import { nowIso, uuid } from '../utils/id';
 import { calcSurvivalRate, rateLevel } from '../utils/rate';
 import type { SurveyDraft } from '../types/survey';
 import { usePlotStore } from './plotStore';
+import { runOnSide } from '../utils/sideRetry';
 
 /** 验收筛选条件（地块 + 等级 + 关键字 + 日期区间） */
 export interface SurveyFilters {
@@ -94,14 +95,18 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
       date: draft.date,
       aliveCount: draft.aliveCount,
       avgHeightCm: draft.avgHeightCm,
+      acceptedPlantCount: total,
       survivalRate,
       grade: rateLevel(survivalRate),
+      gradeSource: 'auto',
       gradeManual: false,
+      rateWriteback: false,
+      rateWritebackReplantId: '',
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: ROW_REVISION,
     };
-    await putSurvey(row);
+    await runOnSide('验收组', () => putSurvey(row));
     set({ revision: get().revision + 1 });
     return row;
   },
@@ -111,20 +116,23 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
     if (!existing) return;
     const total = totalPlantedOf(draft.plotId);
     const survivalRate = calcSurvivalRate(draft.aliveCount, total);
-    await putSurvey({
+    await runOnSide('验收组', () => putSurvey({
       ...existing,
       plotId: draft.plotId,
       round: draft.round,
       date: draft.date,
       aliveCount: draft.aliveCount,
       avgHeightCm: draft.avgHeightCm,
+      acceptedPlantCount: total,
       survivalRate,
-    });
+      rateWriteback: false,
+      rateWritebackReplantId: '',
+    }));
     set({ revision: get().revision + 1 });
   },
 
   async deleteSurvey(surveyId) {
-    await removeSurvey(surveyId);
+    await runOnSide('验收组', () => removeSurvey(surveyId));
     set({ selectedIds: get().selectedIds.filter((id) => id !== surveyId), revision: get().revision + 1 });
   },
 
@@ -132,7 +140,7 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
     const ids = get().selectedIds;
     if (ids.length === 0) return 0;
     // 人工复核只改写等级标注，不改写实测成活率数值，保证数据可追溯
-    await patchSurveyGrades(ids, level);
+    await runOnSide('验收组', () => patchSurveyGrades(ids, level));
     set({ revision: get().revision + 1, lastMessage: `已批量调整 ${ids.length} 条验收记录的成活率等级` });
     return ids.length;
   },
@@ -142,20 +150,27 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
     const plot = usePlotStore.getState().plots.find((row) => row.id === plotId);
     if (!plot) return '地块不存在，无法生成补植计划';
     const missing = summary.suggestReplant;
+    const total = summary.latest?.acceptedPlantCount ?? summary.totalCount;
     if (missing <= 0) return '该地块当前无缺株，无需生成补植计划';
     const species = usePlotStore.getState().seedlings.find((row) => row.plotId === plotId)?.species ?? '秋茄';
     const stamp = nowIso();
-    await db.replants.put({
-      id: uuid('replant'),
-      plotId,
-      missingCount: missing,
-      planDate: new Date(Date.now() + 15 * 24 * 3600 * 1000).toISOString().slice(0, 10),
-      species,
-      state: '待补植',
-      createdAt: stamp,
-      updatedAt: stamp,
-      revision: 2,
-    });
+    await runOnSide('验收组', () =>
+      db.replants.put({
+        id: uuid('replant'),
+        plotId,
+        missingCount: missing,
+        planDate: new Date(Date.now() + 15 * 24 * 3600 * 1000).toISOString().slice(0, 10),
+        species,
+        state: '待补植',
+        baselinePlantCount: total,
+        reconciliationStatus: 'pending',
+        holdReason: '',
+        confirmedAt: '',
+        createdAt: stamp,
+        updatedAt: stamp,
+        revision: ROW_REVISION,
+      }),
+    );
     set({ revision: get().revision + 1, lastMessage: `已为「${plot.name}」生成补植计划：缺株 ${missing} 株` });
     return `已生成补植计划：缺株 ${missing} 株`;
   },

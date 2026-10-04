@@ -23,6 +23,8 @@ export interface SurvivalPoint {
   date: string;
   aliveCount: number;
   avgHeightCm: number;
+  /** 验收组保存测次时认定的栽植株数 */
+  acceptedPlantCount: number;
   /** 该测次的成活率（%） */
   rate: number;
   /** 是否被人工复核过等级 */
@@ -72,16 +74,18 @@ export function buildSurvivalSummary(
     .filter((row) => row.plotId === plotId)
     .sort((a, b) => a.round - b.round)
     .map((row) => {
-      const rate = totalCount > 0 ? calcSurvivalRate(row.aliveCount, totalCount) : row.survivalRate;
+      const rate = row.acceptedPlantCount > 0 ? calcSurvivalRate(row.aliveCount, row.acceptedPlantCount) : row.survivalRate;
+      const gradeManual = row.gradeSource === 'manual' || row.gradeManual;
       return {
         surveyId: row.id,
         round: row.round,
         date: row.date,
         aliveCount: row.aliveCount,
         avgHeightCm: row.avgHeightCm,
+        acceptedPlantCount: row.acceptedPlantCount,
         rate,
-        gradeManual: row.gradeManual,
-        level: row.gradeManual ? row.grade : rateLevel(rate),
+        gradeManual,
+        level: gradeManual ? row.grade : rateLevel(rate),
       };
     });
 
@@ -99,7 +103,7 @@ export function buildSurvivalSummary(
     trend: latest && previous ? round1(latest.rate - previous.rate) : 0,
     heightDelta: growth.delta,
     heightPct: growth.pct,
-    suggestReplant: latest ? suggestReplantCount(totalCount, latest.aliveCount) : totalCount,
+    suggestReplant: latest ? suggestReplantCount(latest.acceptedPlantCount, latest.aliveCount) : totalCount,
     level: latest ? latest.level : 'poor',
     warn: latest !== null && latest.rate < threshold,
   };

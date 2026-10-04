@@ -42,7 +42,7 @@ docker compose up -d --build       # 改完代码后重新构建
 | 构建 | Vite 5 | 开发端口与宿主端口一致（22814） |
 | 路由 | React Router 6 | `createBrowserRouter` + 路由懒加载 |
 | 状态管理 | Zustand 4 | 跨页状态集中在 store，页面只读 store |
-| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbmangrove`，含 v1 → v2 升级迁移 |
+| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbmangrove`，含 v1 → v2 → v3 升级迁移 |
 | 时间处理 | dayjs | |
 | 容器 | node:20-alpine → nginx:alpine | 多阶段构建，`chmod -R a+rX` 规避静态资源 403 |
 
@@ -100,11 +100,12 @@ sologsb101-1014/
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
 * **数据库名**：`gbmangrove`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`，`version(1)` 建立全部表，`version(2)` 补齐索引并执行 `.upgrade()` 迁移：
-  * 为 `plots` 增加 `updatedAt`、`surveys` 增加 `[plotId+round]` 复合索引、`plantings` 增加 `spacingM` 索引等；
-  * 回填 `revision` / `createdAt` / `updatedAt`；
-  * 为 `plots` 补齐 `missingCount`、`lastReplantDate` 回写字段；
-  * 为 `surveys` 补齐 `grade`、`gradeManual` 字段（按 `survivalRate` 自动判定等级）。
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`，`version(1)` 建立全部表，`version(2)` 补齐索引并执行迁移，`version(3)` 拆分现场班组与验收组留痕：
+  * v2 为 `plots` 增加 `updatedAt`、`surveys` 增加 `[plotId+round]` 复合索引、`plantings` 增加 `spacingM` 索引等；
+  * v2 回填 `revision` / `createdAt` / `updatedAt`，补齐 `plots.missingCount`、`plots.lastReplantDate`、`surveys.grade`、`surveys.gradeManual`；
+  * v3 新增 `replantCompletions` 表，现场班组只保存实际补植株数、完成日期与班组；
+  * v3 为验收测次补齐 `acceptedPlantCount`、`gradeSource`、`rateWriteback`、`rateWritebackReplantId`，为补植计划补齐 `baselinePlantCount`、`reconciliationStatus`、`holdReason`、`confirmedAt`；
+  * 旧数据缺少定级来源和回写标记时，按当时保存的成活率及历史补植状态补齐，不覆盖人工定级结论。
 * **表结构**：
 
   | 表 | 主键 | 主要索引 |
@@ -113,14 +114,15 @@ sologsb101-1014/
   | `seedlings` | id | plotId, species, source, arrivalDate, quantity |
   | `plantings` | id | plotId, seedlingId, plantDate, spacingM |
   | `surveys` | id | plotId, [plotId+round], date, grade |
-  | `replants` | id | plotId, planDate, state, species |
+  | `replants` | id | plotId, planDate, state, species, reconciliationStatus |
+  | `replantCompletions` | id（= replantId） | replantId, plotId, completedDate |
 
 * **首屏演示数据**：`initDatabase()` 在打开数据库后检测 `plots` 表是否为空，为空则调用 `utils/seed.ts` 播种，
   幂等且只执行一次。播种链路为 **地块 → 苗木批次 → 栽植 → 验收 → 补植** 三层互相引用：
   * 3 个地块（东港南堤 3 号地块 / 西湾滩涂 A 区 / 北屿外滩 B 区），覆盖三种潮位带与三种底质；
   * 6 个苗木批次（每地块 2 批）、6 条栽植记录（每地块 2 条，引用真实批次 id）；
   * 7 条验收记录（每地块 2–3 个测次，成活率自洽：90.0% → 85.0% → 79.0% 等）；
-  * 3 条补植计划（覆盖待补植 / 已补植 / 已复核三种状态）。
+  * 3 条补植计划（覆盖待补植 / 现场已补植待验收确认 / 已复核三种阶段）。
   * 固定 id 如 `plot-donggang-3`、`plot-xiwan-a`、`plot-beiyu-b` 可直接用于深链验证。
 * **其他本地数据**：`localStorage` 仅保存「最近选中的地块 id」这一界面偏好，不存业务数据。
 * 删除地块会**级联清理**其下的苗木批次、栽植记录、验收记录与补植计划（同一 Dexie 事务内完成）。
@@ -147,8 +149,9 @@ npm run preview      # 预览 dist 产物
 
 ## 七、核心业务规则
 
-* **成活率** = 成活株数 ÷ 该地块栽植总株数 × 100%（`src/utils/rate.ts` 统一口径）。
+* **分侧留痕**：现场班组维护苗木批次、栽植记录与实际补植完成记录；项目部验收组维护验收测次与补植计划。两侧各自保存和重试，不能跨侧改写。
+* **株数变化重算**：栽植株数变化后，仅未人工定级的测次按验收组保存的株数口径重算；人工定过级的测次保持原结论。
+* **补植确认**：现场推进补植只在 `replantCompletions` 留下实际补植株数和完成日期；验收组确认后才更新最新测次成活率并标记回写。实际株数与计划缺株数对不上时，只把该补植计划挂起并记录原因，不重算成活率。
+* **成活率** = 成活株数 ÷ 验收组保存该测次时认定的栽植株数 × 100%（`src/utils/rate.ts` 统一口径）。
 * **成活率等级**：≥ 85% 优，70%–85% 良，50%–70% 一般，< 50% 差；低于 50% 视为告警，建议生成补植计划。
 * **密度合理性**：平均单株占地面积需落在 0.6–12 ㎡/株；过密/过疏都会在栽植记录页给出提示。
-* **补植回写**：补植状态推进到「已补植」时，自动扣减地块缺株数、写入最近补植日期，
-  并按「原成活株数 + 本次补植株数」重算最新一次验收的成活率。

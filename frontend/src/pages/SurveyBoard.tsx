@@ -69,7 +69,7 @@ export default function SurveyBoard() {
   const deleteSurvey = useSurveyStore((state) => state.deleteSurvey);
   const surveyRevision = useSurveyStore((state) => state.revision);
 
-  const { rows, loading, remove } = useIdbTable<Survey>(db.surveys, { sortByUpdatedAt: false });
+  const { rows, loading } = useIdbTable<Survey>(db.surveys, { sortByUpdatedAt: false });
 
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<Survey | null>(null);
@@ -269,7 +269,10 @@ export default function SurveyBoard() {
       key: 'gradeSource',
       width: 110,
       render: (_value, record) =>
-        record.gradeManual ? <Tag color="purple">人工复核</Tag> : <Tag>自动判定</Tag>,
+        <Space direction="vertical" size={0}>
+          <span>{record.gradeSource === 'manual' ? '人工定级' : '自动测算'}</span>
+          {record.rateWriteback ? <Typography.Text type="success" style={{ fontSize: 12 }}>补植确认回写</Typography.Text> : null}
+        </Space>,
     },
     {
       title: '操作',
@@ -287,7 +290,6 @@ export default function SurveyBoard() {
             cancelText="取消"
             onConfirm={async () => {
               await deleteSurvey(record.id);
-              await remove(record.id);
               message.success('验收记录已删除');
             }}
           >
@@ -491,7 +493,7 @@ export default function SurveyBoard() {
             </Form.Item>
           </Space>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            成活率 = 成活株数 / 该地块栽植总株数，保存时自动计算；成活率低于 {SURVIVAL_WARN_RATE}% 会给出告警提示。
+            验收组保存时会留存本测次认定的栽植总株数；后续现场补录只重算自动测次，人工定级保持不变。补植记录需由验收组确认后才回写成活率。
           </Typography.Text>
         </Form>
       </Modal>

@@ -29,7 +29,9 @@ import EmptyPanel from '../components/common/EmptyPanel';
 import StatBadge from '../components/common/StatBadge';
 import { useIdbTable } from '../hooks/useIdbTable';
 import { usePlotStore } from '../stores/plotStore';
-import { db } from '../utils/db';
+import { ROW_REVISION, db } from '../utils/db';
+import { deleteSeedlingOnFieldSide, saveSeedlingOnFieldSide } from '../utils/fieldOperations';
+import { nowIso, uuid } from '../utils/id';
 import {
   SEEDLING_SOURCE_OPTIONS,
   SEEDLING_SPECIES_OPTIONS,
@@ -58,7 +60,7 @@ export default function SeedlingBoard() {
   const ready = usePlotStore((state) => state.ready);
   const plot = usePlotStore((state) => state.plots.find((item) => item.id === id));
   const plantings = usePlotStore((state) => state.plantings);
-  const { rows, loading, create, update, remove } = useIdbTable<Seedling>(db.seedlings, { sortByUpdatedAt: false });
+  const { rows, loading } = useIdbTable<Seedling>(db.seedlings, { sortByUpdatedAt: false });
 
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<Seedling | null>(null);
@@ -115,13 +117,16 @@ export default function SeedlingBoard() {
         quantity: values.quantity,
         arrivalDate: values.arrivalDate.format('YYYY-MM-DD'),
       };
-      if (editing === null) {
-        await create(payload, 'seedling');
-        message.success(`已登记苗木批次：${payload.species} ${payload.quantity} 株`);
-      } else {
-        await update(editing.id, payload);
-        message.success('苗木批次已更新');
-      }
+      const stamp = nowIso();
+      const row: Seedling = {
+        id: editing?.id ?? uuid('seedling'),
+        ...payload,
+        createdAt: editing?.createdAt ?? stamp,
+        updatedAt: stamp,
+        revision: ROW_REVISION,
+      };
+      await saveSeedlingOnFieldSide(row);
+      message.success(editing === null ? `已登记苗木批次：${payload.species} ${payload.quantity} 株` : '苗木批次已更新');
       setOpen(false);
     } catch (error) {
       if (error instanceof Error) message.error(error.message);
@@ -132,10 +137,11 @@ export default function SeedlingBoard() {
 
   const handleDelete = async (row: Seedling): Promise<void> => {
     const bound = plantings.filter((item) => item.seedlingId === row.id).length;
-    await remove(row.id);
+    const result = await deleteSeedlingOnFieldSide(row.plotId, row.id);
     message.success(
-      bound > 0 ? `已删除批次（同时清理了 ${bound} 条引用它的栽植记录）` : '已删除苗木批次',
+      bound > 0 ? `${result.fieldMessage}（同时清理了 ${bound} 条引用它的栽植记录）` : result.fieldMessage,
     );
+    if (result.acceptanceMessage) message.info(result.acceptanceMessage, 5);
   };
 
   if (!ready) {

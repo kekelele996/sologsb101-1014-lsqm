@@ -6,7 +6,8 @@
 import { create } from 'zustand';
 import type { Replant, ReplantDraft, ReplantState } from '../types/replant';
 import {
-  advanceReplantState,
+  ROW_REVISION,
+  confirmReplantCompletion,
   db,
   exportSnapshot,
   importSnapshot,
@@ -16,8 +17,11 @@ import {
   resetDatabase,
   type DatabaseSnapshot,
 } from '../utils/db';
+import { deleteReplantCompletionOnFieldSide, saveReplantCompletionOnFieldSide } from '../utils/fieldOperations';
+import type { ReplantCompletion } from '../types/replantCompletion';
 import { nowIso, uuid } from '../utils/id';
 import { usePlotStore } from './plotStore';
+import { runOnSide } from '../utils/sideRetry';
 
 /** 补植计划筛选条件 */
 export interface ReplantFilters {
@@ -43,11 +47,21 @@ export interface ReplantStoreState {
   hasDraft: (replantId: string) => boolean;
   saveDraft: (replantId: string) => Promise<void>;
   createReplant: (draft: ReplantDraft) => Promise<Replant>;
+  saveReplantEdit: (replantId: string, draft: ReplantDraft) => Promise<void>;
   deleteReplant: (replantId: string) => Promise<void>;
-  /** 推进到下一状态；进入「已补植」时回写地块缺株数并重算成活率 */
-  advance: (replantId: string) => Promise<ReplantState | null>;
-  setState: (replantId: string, state: ReplantState) => Promise<void>;
-  batchAdvance: () => Promise<number>;
+  /** 现场班组提交实际补植株数和日期（不改验收结论） */
+  completeOnFieldSide: (input: {
+    replantId: string;
+    plotId: string;
+    actualCount: number;
+    completedDate: string;
+    operator: string;
+  }) => Promise<string>;
+  /** 现场班组撤回自己的完成记录 */
+  withdrawCompletion: (replantId: string) => Promise<string>;
+  /** 验收组确认现场完成记录；对不上时在验收计划侧挂起 */
+  confirmCompletion: (replantId: string) => Promise<{ status: 'confirmed' | 'hold'; message: string }>;
+  batchConfirm: () => Promise<{ confirmed: number; held: number }>;
   setSelectedIds: (ids: string[]) => void;
   setReviewState: (state: ReplantState | 'all') => void;
   exportAll: () => Promise<DatabaseSnapshot>;
@@ -56,7 +70,6 @@ export interface ReplantStoreState {
 }
 
 const EMPTY_FILTERS: ReplantFilters = { plotId: 'all', state: 'all', keyword: '' };
-const FLOW: ReplantState[] = ['待补植', '已补植', '已复核'];
 
 export const useReplantStore = create<ReplantStoreState>((set, get) => ({
   filters: { ...EMPTY_FILTERS },
@@ -98,7 +111,7 @@ export const useReplantStore = create<ReplantStoreState>((set, get) => ({
     if (draft === undefined) return;
     const existing = await db.replants.get(replantId);
     if (!existing) return;
-    await putReplant({ ...existing, ...draft } as Replant);
+    await runOnSide('验收组', () => putReplant({ ...existing, ...draft } as Replant));
     get().clearDraft(replantId);
     set({ revision: get().revision + 1, lastMessage: '草稿已保存到补植计划' });
   },
@@ -111,18 +124,40 @@ export const useReplantStore = create<ReplantStoreState>((set, get) => ({
       missingCount: draft.missingCount,
       planDate: draft.planDate,
       species: draft.species,
-      state: draft.state,
+      state: draft.state === '已复核' ? '待补植' : draft.state,
+      baselinePlantCount: usePlotStore
+        .getState()
+        .plantings.filter((row) => row.plotId === draft.plotId)
+        .reduce((acc, row) => acc + row.count, 0),
+      reconciliationStatus: 'pending',
+      holdReason: '',
+      confirmedAt: '',
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: ROW_REVISION,
     };
-    await putReplant(row);
+    await runOnSide('验收组', () => putReplant(row));
     set({ revision: get().revision + 1 });
     return row;
   },
 
+  async saveReplantEdit(replantId, draft) {
+    const existing = await db.replants.get(replantId);
+    if (!existing) return;
+    await runOnSide('验收组', () =>
+      putReplant({
+        ...existing,
+        plotId: draft.plotId,
+        missingCount: draft.missingCount,
+        planDate: draft.planDate,
+        species: draft.species,
+      }),
+    );
+    set({ revision: get().revision + 1 });
+  },
+
   async deleteReplant(replantId) {
-    await removeReplant(replantId);
+    await runOnSide('验收组', () => removeReplant(replantId));
     get().clearDraft(replantId);
     set({
       selectedIds: get().selectedIds.filter((id) => id !== replantId),
@@ -130,35 +165,55 @@ export const useReplantStore = create<ReplantStoreState>((set, get) => ({
     });
   },
 
-  async advance(replantId) {
-    const existing = await db.replants.get(replantId);
-    if (!existing) return null;
-    const index = FLOW.indexOf(existing.state);
-    if (index < 0 || index >= FLOW.length - 1) return null;
-    const next = FLOW[index + 1];
-    await advanceReplantState(replantId, next);
+  async completeOnFieldSide(input) {
+    const row: ReplantCompletion = {
+      id: input.replantId,
+      replantId: input.replantId,
+      plotId: input.plotId,
+      actualCount: input.actualCount,
+      completedDate: input.completedDate,
+      operator: input.operator,
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+      revision: ROW_REVISION,
+    };
+    const message = await saveReplantCompletionOnFieldSide(row);
+    set({ revision: get().revision + 1, lastMessage: message });
+    return message;
+  },
+
+  async withdrawCompletion(replantId) {
+    const message = await deleteReplantCompletionOnFieldSide(replantId);
+    set({ revision: get().revision + 1, lastMessage: message });
+    return message;
+  },
+
+  async confirmCompletion(replantId) {
+    const result = await runOnSide('验收组', () => confirmReplantCompletion(replantId));
     await usePlotStore.getState().refreshCounts();
     set({
       revision: get().revision + 1,
-      lastMessage: next === '已补植' ? '已标记补植完成，地块缺株数与成活率已回写' : `状态已推进为「${next}」`,
+      lastMessage: result.message,
     });
-    return next;
+    return result;
   },
 
-  async setState(replantId, state) {
-    await advanceReplantState(replantId, state);
-    set({ revision: get().revision + 1 });
-  },
-
-  async batchAdvance() {
+  async batchConfirm() {
     const ids = get().selectedIds;
-    let count = 0;
+    let confirmed = 0;
+    let held = 0;
     for (const id of ids) {
-      const next = await get().advance(id);
-      if (next !== null) count += 1;
+      const completion = await db.replantCompletions.get(id);
+      if (!completion) continue;
+      const result = await get().confirmCompletion(id);
+      if (result.status === 'confirmed') confirmed += 1;
+      else held += 1;
     }
-    set({ selectedIds: [], lastMessage: `已批量推进 ${count} 条补植计划` });
-    return count;
+    set({
+      selectedIds: [],
+      lastMessage: `验收组已批量确认：${confirmed} 条通过，${held} 条挂起`,
+    });
+    return { confirmed, held };
   },
 
   setSelectedIds(ids) {

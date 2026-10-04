@@ -30,7 +30,9 @@ import FilterBar from '../components/common/FilterBar';
 import StatBadge from '../components/common/StatBadge';
 import { useIdbTable } from '../hooks/useIdbTable';
 import { usePlotStore } from '../stores/plotStore';
-import { db } from '../utils/db';
+import { ROW_REVISION, db } from '../utils/db';
+import { deletePlantingOnFieldSide, savePlantingOnFieldSide } from '../utils/fieldOperations';
+import { nowIso, uuid } from '../utils/id';
 import type { Planting } from '../types/planting';
 import type { Seedling } from '../types/seedling';
 import { ROUTES } from '../router';
@@ -66,7 +68,7 @@ export default function PlantingEntry() {
   const plot = usePlotStore((state) => state.plots.find((item) => item.id === id));
 
   const seedlingTable = useIdbTable<Seedling>(db.seedlings, { sortByUpdatedAt: false });
-  const { rows, loading, create, update, remove } = useIdbTable<Planting>(db.plantings, { sortByUpdatedAt: false });
+  const { rows, loading } = useIdbTable<Planting>(db.plantings, { sortByUpdatedAt: false });
 
   const [keyword, setKeyword] = useState('');
   const [operatorFilter, setOperatorFilter] = useState('all');
@@ -160,13 +162,17 @@ export default function PlantingEntry() {
         count: values.count,
         operator: values.operator.trim(),
       };
-      if (editing === null) {
-        await create(payload, 'planting');
-        message.success(`已登记栽植 ${payload.count} 株`);
-      } else {
-        await update(editing.id, payload);
-        message.success('栽植记录已更新');
-      }
+      const stamp = nowIso();
+      const row: Planting = {
+        id: editing?.id ?? uuid('planting'),
+        ...payload,
+        createdAt: editing?.createdAt ?? stamp,
+        updatedAt: stamp,
+        revision: ROW_REVISION,
+      };
+      const result = await savePlantingOnFieldSide(row);
+      message.success(editing === null ? `已登记栽植 ${payload.count} 株` : '栽植记录已更新');
+      if (result.acceptanceMessage) message.info(result.acceptanceMessage, 5);
       const check = plot === undefined ? null : checkDensity(plot.areaMu, payload.spacingM, payload.count);
       if (check !== null && !check.ok) {
         message.warning(check.message, 6);
@@ -273,8 +279,9 @@ export default function PlantingEntry() {
             okButtonProps={{ danger: true }}
             cancelText="取消"
             onConfirm={async () => {
-              await remove(record.id);
-              message.success('栽植记录已删除');
+              const result = await deletePlantingOnFieldSide(record.plotId, record.id);
+              message.success(result.fieldMessage);
+              if (result.acceptanceMessage) message.info(result.acceptanceMessage, 5);
             }}
           >
             <Button size="small" type="link" danger icon={<DeleteOutlined />}>
@@ -313,6 +320,14 @@ export default function PlantingEntry() {
           hint="已被栽植记录引用的苗木批次占全部批次的比例"
         />
       </div>
+
+      <Alert
+        type="info"
+        showIcon
+        style={{ marginBottom: 14 }}
+        message="现场栽植记录与验收记录分侧保存"
+        description="这里只能修改现场班组的苗木批次与栽植记录；株数变化只会触发未人工定级测次重算，验收组人工定过的等级保持原样。"
+      />
 
       {plotSeedlings.length === 0 ? (
         <Alert

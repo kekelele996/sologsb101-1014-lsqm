@@ -9,6 +9,7 @@ import type { Seedling } from '../types/seedling';
 import type { Planting } from '../types/planting';
 import type { Survey } from '../types/survey';
 import type { Replant } from '../types/replant';
+import type { ReplantCompletion } from '../types/replantCompletion';
 import { calcSurvivalRate, rateLevel } from './rate';
 
 const SEED_TIME = '2025-01-06T02:00:00.000Z';
@@ -32,20 +33,52 @@ function plantingRow(row: Omit<Planting, 'createdAt' | 'updatedAt' | 'revision'>
   return { ...row, createdAt: SEED_TIME, updatedAt: SEED_TIME, revision: ROW_REVISION };
 }
 
-function surveyRow(row: Omit<Survey, 'createdAt' | 'updatedAt' | 'revision' | 'grade' | 'gradeManual' | 'survivalRate'>, total: number): Survey {
+function surveyRow(
+  row: Omit<
+    Survey,
+    | 'createdAt'
+    | 'updatedAt'
+    | 'revision'
+    | 'grade'
+    | 'gradeManual'
+    | 'gradeSource'
+    | 'acceptedPlantCount'
+    | 'rateWriteback'
+    | 'rateWritebackReplantId'
+    | 'survivalRate'
+  >,
+  total: number,
+): Survey {
   const survivalRate = calcSurvivalRate(row.aliveCount, total);
   return {
     ...row,
     survivalRate,
+    acceptedPlantCount: total,
     grade: rateLevel(survivalRate),
+    gradeSource: 'auto',
     gradeManual: false,
+    rateWriteback: false,
+    rateWritebackReplantId: '',
     createdAt: SEED_TIME,
     updatedAt: SEED_TIME,
     revision: ROW_REVISION,
   };
 }
 
-function replantRow(row: Omit<Replant, 'createdAt' | 'updatedAt' | 'revision'>): Replant {
+function replantRow(row: Omit<Replant, 'createdAt' | 'updatedAt' | 'revision' | 'baselinePlantCount' | 'reconciliationStatus' | 'holdReason' | 'confirmedAt'>): Replant {
+  return {
+    ...row,
+    baselinePlantCount: 0,
+    reconciliationStatus: row.state === '待补植' ? 'pending' : 'confirmed',
+    holdReason: '',
+    confirmedAt: row.state === '已复核' ? row.planDate : '',
+    createdAt: SEED_TIME,
+    updatedAt: SEED_TIME,
+    revision: ROW_REVISION,
+  };
+}
+
+function completionRow(row: Omit<ReplantCompletion, 'createdAt' | 'updatedAt' | 'revision'>): ReplantCompletion {
   return { ...row, createdAt: SEED_TIME, updatedAt: SEED_TIME, revision: ROW_REVISION };
 }
 
@@ -122,28 +155,49 @@ export async function seedDatabase(): Promise<void> {
   };
 
   // ---------------- 验收记录（每地块 2–3 个测次） ----------------
+  const surveyC2: Survey = {
+    ...surveyRow({ id: 'survey-c2', plotId: SEED_IDS.plotC, round: 2, date: '2024-08-30', aliveCount: 8000, avgHeightCm: 88 }, totalByPlot[SEED_IDS.plotC]),
+    rateWriteback: true,
+    rateWritebackReplantId: 'replant-c1',
+  };
   const surveys: Survey[] = [
     surveyRow({ id: 'survey-a1', plotId: SEED_IDS.plotA, round: 1, date: '2024-06-20', aliveCount: 4680, avgHeightCm: 62 }, totalByPlot[SEED_IDS.plotA]),
     surveyRow({ id: 'survey-a2', plotId: SEED_IDS.plotA, round: 2, date: '2024-09-18', aliveCount: 4420, avgHeightCm: 78 }, totalByPlot[SEED_IDS.plotA]),
     surveyRow({ id: 'survey-a3', plotId: SEED_IDS.plotA, round: 3, date: '2025-03-15', aliveCount: 4108, avgHeightCm: 96 }, totalByPlot[SEED_IDS.plotA]),
     surveyRow({ id: 'survey-b1', plotId: SEED_IDS.plotB, round: 1, date: '2024-07-05', aliveCount: 2772, avgHeightCm: 41 }, totalByPlot[SEED_IDS.plotB]),
-    surveyRow({ id: 'survey-b2', plotId: SEED_IDS.plotB, round: 2, date: '2024-10-12', aliveCount: 2112, avgHeightCm: 55 }, totalByPlot[SEED_IDS.plotB]),
-    surveyRow({ id: 'survey-c1', plotId: SEED_IDS.plotC, round: 1, date: '2024-05-28', aliveCount: 7680, avgHeightCm: 70 }, totalByPlot[SEED_IDS.plotC]),
-    surveyRow({ id: 'survey-c2', plotId: SEED_IDS.plotC, round: 2, date: '2024-08-30', aliveCount: 7440, avgHeightCm: 88 }, totalByPlot[SEED_IDS.plotC]),
+    surveyRow({ id: 'survey-b2', plotId: SEED_IDS.plotB, round: 2, date: '2024-10-12', aliveCount: 2112, avgHeightCm: 55 }, totalByPlot[SEED_IDS.plotB] - 1188),
+    surveyRow({ id: 'survey-c1', plotId: SEED_IDS.plotC, round: 1, date: '2024-05-28', aliveCount: 7040, avgHeightCm: 70 }, totalByPlot[SEED_IDS.plotC] - 560),
+    surveyC2,
   ];
 
-  // ---------------- 补植计划（每地块 1 条，覆盖三种状态） ----------------
+  // ---------------- 补植计划（待补植 / 现场已完成待确认 / 已复核） ----------------
   const replants: Replant[] = [
-    replantRow({ id: 'replant-a1', plotId: SEED_IDS.plotA, missingCount: 1092, planDate: '2025-04-10', species: '秋茄', state: '待补植' }),
-    replantRow({ id: 'replant-b1', plotId: SEED_IDS.plotB, missingCount: 1188, planDate: '2025-04-18', species: '白骨壤', state: '已补植' }),
-    replantRow({ id: 'replant-c1', plotId: SEED_IDS.plotC, missingCount: 560, planDate: '2024-11-05', species: '无瓣海桑', state: '已复核' }),
+    { ...replantRow({ id: 'replant-a1', plotId: SEED_IDS.plotA, missingCount: 1092, planDate: '2025-04-10', species: '秋茄', state: '待补植' }), baselinePlantCount: totalByPlot[SEED_IDS.plotA] },
+    {
+      ...replantRow({ id: 'replant-b1', plotId: SEED_IDS.plotB, missingCount: 1188, planDate: '2025-04-18', species: '白骨壤', state: '待补植' }),
+      baselinePlantCount: totalByPlot[SEED_IDS.plotB],
+      reconciliationStatus: 'pending',
+      confirmedAt: '',
+    },
+    {
+      ...replantRow({ id: 'replant-c1', plotId: SEED_IDS.plotC, missingCount: 560, planDate: '2024-11-05', species: '无瓣海桑', state: '已复核' }),
+      baselinePlantCount: totalByPlot[SEED_IDS.plotC] - 560,
+      reconciliationStatus: 'confirmed',
+      confirmedAt: '2024-11-08',
+    },
   ];
 
-  await db.transaction('rw', db.plots, db.seedlings, db.plantings, db.surveys, db.replants, async () => {
+  const replantCompletions: ReplantCompletion[] = [
+    completionRow({ id: 'replant-b1', replantId: 'replant-b1', plotId: SEED_IDS.plotB, actualCount: 1188, completedDate: '2025-04-20', operator: '西湾补植班' }),
+    completionRow({ id: 'replant-c1', replantId: 'replant-c1', plotId: SEED_IDS.plotC, actualCount: 560, completedDate: '2024-11-08', operator: '北屿补植班' }),
+  ];
+
+  await db.transaction('rw', [db.plots, db.seedlings, db.plantings, db.surveys, db.replants, db.replantCompletions], async () => {
     await db.plots.bulkPut(plots);
     await db.seedlings.bulkPut(seedlings);
     await db.plantings.bulkPut(plantings);
     await db.surveys.bulkPut(surveys);
     await db.replants.bulkPut(replants);
+    await db.replantCompletions.bulkPut(replantCompletions);
   });
 }
